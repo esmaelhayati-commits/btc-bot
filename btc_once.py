@@ -10,7 +10,8 @@ MANUAL_RUN = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
 TRADE_USDT = 1000        # حجم معامله فرضی
 FEE_XT = 0.002           # کارمزد معامله XT (حدس: ۰.۲٪)
 FEE_LBANK = 0.001        # کارمزد معامله LBank (حدس: ۰.۱٪)
-PREFILTER_PCT = 0.5      # پیش‌فیلتر با آخرین قیمت معامله
+PREFILTER_PCT = 0.5      # حداقل اختلاف با آخرین قیمت معامله برای بررسی دقیق
+PREFILTER_MAX_PCT = 30   # اختلاف بیشتر از این معمولاً آشغاله و رد می‌شه
 MAX_LBANK_BOOKS = 40     # حداکثر تعداد کوین برای بررسی دقیق در LBank
 MIN_GROSS_PCT = 1.0      # حداقل اختلاف ناخالص برای بررسی بیشتر
 MIN_NET_USDT = 5         # حداقل سود خالص (دلار) برای ارسال پیام
@@ -145,7 +146,7 @@ def main():
         xbid, xbq, xask, xaq = xt[sym]
         mid = (xbid + xask) / 2
         gap = abs(lb_last[sym] - mid) / mid * 100
-        if gap >= PREFILTER_PCT:
+        if PREFILTER_PCT <= gap <= PREFILTER_MAX_PCT:
             pre.append((gap, sym))
     pre.sort(reverse=True)
 
@@ -248,14 +249,18 @@ def main():
         lines.append(f"تعداد کوین‌های مشترک (جفت USDT): {len(common)}")
         lines.append(f"بررسی دقیق شده: {len(lb)} کوین")
         lines.append("بعد از کارمزدها فرصت سودآوری پیدا نشد.")
-        if gaps:
+        real = [g for g in gaps if g["depth"] >= MIN_DEPTH_USDT]
+        if real:
             lines.append("")
-            lines.append("بیشترین اختلاف‌ها (قبل از کارمزد):")
-            for g in gaps[:TOP_N]:
+            lines.append(f"بیشترین اختلاف‌ها با حجم حداقل {MIN_DEPTH_USDT}$ (قبل از کارمزد):")
+            for g in real[:TOP_N]:
                 lines.append(
                     f"{g['sym'][:-5].upper()}: {g['gross']:.2f}% "
                     f"(بخر {g['buy']} ← بفروش {g['sell']}، حجم {g['depth']:,.0f}$)"
                 )
+        else:
+            lines.append("")
+            lines.append("اختلافی با حجم قابل معامله پیدا نشد.")
     else:
         print("فرصتی پیدا نشد")
         return
