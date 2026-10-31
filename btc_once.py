@@ -12,7 +12,7 @@ FEE_XT = 0.002           # کارمزد معامله XT (حدس: ۰.۲٪)
 FEE_LBANK = 0.001        # کارمزد معامله LBank (حدس: ۰.۱٪)
 PREFILTER_PCT = 0.5      # حداقل اختلاف با آخرین قیمت معامله برای بررسی دقیق
 PREFILTER_MAX_PCT = 30   # اختلاف بیشتر از این معمولاً آشغاله و رد می‌شه
-MAX_LBANK_BOOKS = 40     # حداکثر تعداد کوین برای بررسی دقیق در LBank
+MAX_LBANK_BOOKS = 400    # حداکثر تعداد کوین برای بررسی دقیق در LBank
 MIN_GROSS_PCT = 1.0      # حداقل اختلاف ناخالص برای بررسی بیشتر
 MIN_NET_USDT = 5         # حداقل سود خالص (دلار) برای ارسال پیام
 MIN_NET_PCT = 0.5        # حداقل سود خالص (درصد)
@@ -20,6 +20,14 @@ MIN_DEPTH_USDT = 300     # حداقل حجم موجود در بالای دفتر
 SUSPECT_GROSS_PCT = 15   # اختلاف بالاتر از این مشکوکه
 MAX_CANDIDATES = 15
 TOP_N = 5
+
+# در اجرای دستی (Run workflow) آستانه‌ها شل می‌شن تا محاسبه‌ها تست بشن.
+# اجرای زمان‌بندی‌شده همیشه با مقدارهای بالا کار می‌کنه.
+if MANUAL_RUN:
+    MIN_GROSS_PCT = 0.1
+    MIN_NET_USDT = -1000
+    MIN_NET_PCT = -100
+    MIN_DEPTH_USDT = 50
 
 
 def num(x, allow_zero=False):
@@ -225,7 +233,11 @@ def main():
 
     lines = []
     if results:
-        lines.append(f"🔔 فرصت آربیتراژ XT ↔ LBank (معامله فرضی {TRADE_USDT:,} $)")
+        title = "🔔 فرصت آربیتراژ XT ↔ LBank"
+        if MANUAL_RUN:
+            title = "🧪 حالت تست (آستانه‌ها شل شده)\n" + title
+        lines.append(f"{title} (معامله فرضی {TRADE_USDT:,} $)")
+        lines.append(f"کوین‌های مشترک: {len(common)} | بررسی دقیق: {len(lb)}")
         lines.append("")
         for r in results[:TOP_N]:
             coin = r["sym"][:-5].upper()
@@ -248,7 +260,7 @@ def main():
         lines.append("✅ اجرای تستی موفق بود")
         lines.append(f"تعداد کوین‌های مشترک (جفت USDT): {len(common)}")
         lines.append(f"بررسی دقیق شده: {len(lb)} کوین")
-        lines.append("بعد از کارمزدها فرصت سودآوری پیدا نشد.")
+        lines.append("هیچ کوینی از فیلترها رد نشد.")
         real = [g for g in gaps if g["depth"] >= MIN_DEPTH_USDT]
         if real:
             lines.append("")
@@ -258,9 +270,6 @@ def main():
                     f"{g['sym'][:-5].upper()}: {g['gross']:.2f}% "
                     f"(بخر {g['buy']} ← بفروش {g['sell']}، حجم {g['depth']:,.0f}$)"
                 )
-        else:
-            lines.append("")
-            lines.append("اختلافی با حجم قابل معامله پیدا نشد.")
     else:
         print("فرصتی پیدا نشد")
         return
