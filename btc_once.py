@@ -8,16 +8,17 @@ CHAT_ID = os.environ["CHAT_ID"]
 MANUAL_RUN = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
 
 # ---------- تنظیمات ----------
-TRADE_USDT = 1000        # حجم معامله فرضی
+TRADE_USDT = 100         # حداکثر سرمایه برای هر معامله
 FEE_XT = 0.002           # کارمزد معامله XT (حدس: ۰.۲٪)
 FEE_LBANK = 0.001        # کارمزد معامله LBank (حدس: ۰.۱٪)
 PREFILTER_PCT = 0.5      # حداقل اختلاف با آخرین قیمت معامله برای بررسی دقیق
 PREFILTER_MAX_PCT = 30   # اختلاف بیشتر از این معمولاً آشغاله و رد می‌شه
 MAX_LBANK_BOOKS = 400    # حداکثر تعداد کوین برای بررسی دقیق در LBank
 MIN_GROSS_PCT = 1.0      # حداقل اختلاف ناخالص برای بررسی بیشتر
-MIN_NET_USDT = 5         # حداقل سود خالص (دلار) برای ارسال پیام
-MIN_NET_PCT = 0.5        # حداقل سود خالص (درصد)
-MIN_DEPTH_USDT = 300     # حداقل حجم موجود در بالای دفتر سفارش‌ها
+MIN_NET_USDT = 1         # حداقل سود خالص (دلار) برای ارسال پیام
+MIN_NET_PCT = 0.8        # حداقل سود خالص (درصد)
+MIN_DEPTH_USDT = 100     # حداقل حجم موجود در بالای دفتر سفارش‌ها
+TARGET_NET_USDT = 1      # برای نمایش «حجم لازم برای این مقدار سود»
 SUSPECT_GROSS_PCT = 15   # اختلاف بالاتر از این مشکوکه
 MAX_CANDIDATES = 15
 TOP_N = 5
@@ -103,6 +104,7 @@ def chains_xt():
         name = str(c.get("currency", "")).lower()
         out[name] = [
             {
+                "chain": ch.get("chain"),
                 "wd": bool(ch.get("withdrawEnabled")),
                 "dep": bool(ch.get("depositEnabled")),
                 "fee": num(ch.get("withdrawFeeAmount"), True),
@@ -119,6 +121,7 @@ def chains_lbank(coin):
         raise RuntimeError(f"LBank withdrawConfigs {coin}: " + str(j)[:300])
     return [
         {
+            "chain": d.get("chain"),
             "wd": str(d.get("canWithDraw")).lower() == "true",
             "dep": None,
             "fee": num(d.get("fee"), True),
@@ -128,7 +131,11 @@ def chains_lbank(coin):
 
 
 def cheapest_withdraw(chains):
-    ok = [c["fee"] for c in chains if c["wd"] and c["fee"] is not None]
+    ok = [
+        (c["fee"], str(c.get("chain") or "؟"))
+        for c in chains
+        if c["wd"] and c["fee"] is not None
+    ]
     return min(ok) if ok else None
 
 
@@ -159,10 +166,21 @@ def format_result(r):
         f"🟢 خرید از <b>{r['buy']}</b>: <code>{fmt(r['ask'])}</code>",
         f"🔴 فروش در <b>{r['sell']}</b>: <code>{fmt(r['bid'])}</code>",
         f"📊 اختلاف ناخالص: <code>{r['gross']:.2f}%</code>",
-        f"💸 کارمزد برداشت: <code>{r['wfee_usd']:.2f}$</code>",
+        f"💸 کارمزد معامله: <code>{r['trade_fee']:.2f}$</code> + "
+        f"برداشت: <code>{r['wfee_usd']:.2f}$</code> = "
+        f"<code>{r['trade_fee'] + r['wfee_usd']:.2f}$</code>",
+        f"🔗 شبکه برداشت: <code>{html.escape(r['chain'])}</code>",
         f"{icon} سود خالص ({r['usable']:,.0f}$): "
         f"<b>{sign}{r['net']:.2f}$ ({sign}{r['net_pct']:.2f}%)</b>",
     ]
+    if r["be"] is None:
+        parts.append("📏 با این اختلاف هیچ حجمی سودآور نیست")
+    else:
+        parts.append(
+            f"📏 حجم سر‌به‌سر: <code>{r['be']:,.0f}$</code> | "
+            f"برای سود {TARGET_NET_USDT}$: <code>{r['need']:,.0f}$</code> "
+            f"(حداکثر قابل خرید: {r['depth']:,.0f}$)"
+        )
     for w in r["warn"]:
         parts.append(f"⚠️ {html.escape(w)}")
     return "\n".join(parts)
@@ -229,9 +247,10 @@ def main():
         except Exception as e:
             print(f"خطا برای {coin}:", e, file=sys.stderr)
             continue
-        wfee = cheapest_withdraw(src)
-        if wfee is None:
+        best = cheapest_withdraw(src)
+        if best is None:
             continue  # برداشت بسته یا نامشخص
+        wfee, chain = best
 
         warn = []
         if g["sell"] == "XT":
@@ -239,21 +258,38 @@ def main():
             if dst and not any(c["dep"] for c in dst):
                 continue  # واریز در XT بسته است
         else:
-            warn.append("باز بودن واریز در LBank رو دستی چک کن")
+            warn.append("باز بودن واریز در LBank (برای همین شبکه) رو دستی چک کن")
         if g["gross"] >= SUSPECT_GROSS_PCT:
             warn.append("اختلاف خیلی زیاده؛ احتمالاً توکن متفاوت با اسم مشابه")
 
-        usable = min(TRADE_USDT, g["depth"])
         fee_buy = FEE_XT if g["buy"] == "XT" else FEE_LBANK
         fee_sell = FEE_LBANK if g["buy"] == "XT" else FEE_XT
-        qty = usable / g["ask"] * (1 - fee_buy) - wfee
+        ask, bid = g["ask"], g["bid"]
+
+        usable = min(TRADE_USDT, g["depth"])
+        qty = usable / ask * (1 - fee_buy) - wfee
         if qty <= 0:
             continue
-        net = qty * g["bid"] * (1 - fee_sell) - usable
+        sell_gross = qty * bid
+        net = sell_gross * (1 - fee_sell) - usable
         net_pct = net / usable * 100
+        trade_fee = usable * fee_buy + sell_gross * fee_sell
+
+        # حجم سر‌به‌سر: net(S) = S*k - fixed
+        k = bid * (1 - fee_buy) * (1 - fee_sell) / ask - 1
+        fixed = wfee * bid * (1 - fee_sell)
+        if k > 0:
+            be = fixed / k
+            need = (TARGET_NET_USDT + fixed) / k
+        else:
+            be = need = None
+
         if net >= MIN_NET_USDT and net_pct >= MIN_NET_PCT:
-            results.append({**g, "wfee_usd": wfee * g["ask"], "usable": usable,
-                            "net": net, "net_pct": net_pct, "warn": warn})
+            results.append({
+                **g, "wfee_usd": wfee * ask, "trade_fee": trade_fee,
+                "chain": chain, "usable": usable, "net": net,
+                "net_pct": net_pct, "be": be, "need": need, "warn": warn,
+            })
     results.sort(key=lambda r: r["net"], reverse=True)
 
     if results:
@@ -261,7 +297,7 @@ def main():
         if MANUAL_RUN:
             header = "🧪 <b>حالت تست</b> (سود منفی عادیه)\n" + header
         info = (
-            f"معامله فرضی: {TRADE_USDT:,}$ | "
+            f"حداکثر سرمایه: {TRADE_USDT:,}$ | "
             f"بررسی‌شده: {len(lb)} از {len(common)} کوین"
         )
         body = ("\n" + SEP + "\n").join(format_result(r) for r in results[:TOP_N])
