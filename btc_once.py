@@ -4,63 +4,223 @@ import requests
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
+MANUAL_RUN = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+
+# ---------- تنظیمات ----------
+TRADE_USDT = 1000        # حجم معامله فرضی
+FEE_XT = 0.002           # کارمزد معامله XT (حدس: ۰.۲٪)
+FEE_LBANK = 0.001        # کارمزد معامله LBank (حدس: ۰.۱٪)
+MIN_GROSS_PCT = 1.0      # حداقل اختلاف ناخالص برای بررسی بیشتر
+MIN_NET_USDT = 5         # حداقل سود خالص (دلار) برای ارسال پیام
+MIN_NET_PCT = 0.5        # حداقل سود خالص (درصد)
+MIN_DEPTH_USDT = 300     # حداقل حجم موجود در بالای دفتر سفارش‌ها
+SUSPECT_GROSS_PCT = 15   # اختلاف بالاتر از این مشکوکه
+MAX_CANDIDATES = 15
+TOP_N = 5
 
 
-def price_xt():
-    r = requests.get(
-        "https://sapi.xt.com/v4/public/ticker/price",
-        params={"symbol": "btc_usdt"},
-        timeout=10,
-    )
-    r.raise_for_status()
-    data = r.json()["result"]
-    item = data[0] if isinstance(data, list) else data
-    return float(item["p"])
-
-
-def price_lbank():
-    r = requests.get(
-        "https://api.lbkex.com/v2/supplement/ticker/price.do",
-        params={"symbol": "btc_usdt"},
-        timeout=10,
-    )
-    r.raise_for_status()
-    data = r.json()["data"]
-    item = data[0] if isinstance(data, list) else data
-    return float(item["price"])
-
-
-def safe(fn):
+def num(x, allow_zero=False):
     try:
-        return fn()
-    except Exception as e:
-        print(f"خطا در {fn.__name__}: {e}", file=sys.stderr)
+        v = float(x)
+    except (TypeError, ValueError):
         return None
+    if v < 0 or (v == 0 and not allow_zero):
+        return None
+    return v
+
+
+def get(url, **params):
+    r = requests.get(url, params=params, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+
+def books_xt():
+    data = get("https://sapi.xt.com/v4/public/ticker/book")["result"]
+    out = {}
+    for it in data:
+        sym = str(it.get("s", "")).lower()
+        if not sym.endswith("_usdt"):
+            continue
+        bid, bq = num(it.get("bp")), num(it.get("bq"))
+        ask, aq = num(it.get("ap")), num(it.get("aq"))
+        if bid and bq and ask and aq:
+            out[sym] = (bid, bq, ask, aq)
+    return out
+
+
+def books_lbank():
+    data = get(
+        "https://api.lbkex.com/v2/supplement/ticker/bookTicker.do",
+        symbol="all",
+    )["data"]
+    out = {}
+    for it in data:
+        sym = str(it.get("symbol", "")).lower()
+        if not sym.endswith("_usdt"):
+            continue
+        bid, bq = num(it.get("bidPrice")), num(it.get("bidQty"))
+        ask, aq = num(it.get("askPrice")), num(it.get("askQty"))
+        if bid and bq and ask and aq:
+            out[sym] = (bid, bq, ask, aq)
+    return out
+
+
+def chains_xt():
+    data = get("https://sapi.xt.com/v4/public/currencies")["result"]
+    if isinstance(data, dict):
+        data = data.get("currencies") or data.get("list") or []
+    out = {}
+    for c in data:
+        name = str(c.get("currency", "")).lower()
+        out[name] = [
+            {
+                "wd": bool(ch.get("withdrawEnabled")),
+                "dep": bool(ch.get("depositEnabled")),
+                "fee": num(ch.get("withdrawFeeAmount"), True),
+            }
+            for ch in (c.get("supportChains") or [])
+        ]
+    return out
+
+
+def chains_lbank(coin):
+    data = get(
+        "https://api.lbkex.com/v2/withdrawConfigs.do", assetCode=coin
+    )["data"]
+    return [
+        {
+            "wd": str(d.get("canWithDraw")).lower() == "true",
+            "dep": None,
+            "fee": num(d.get("fee"), True),
+        }
+        for d in data
+    ]
+
+
+def cheapest_withdraw(chains):
+    ok = [c["fee"] for c in chains if c["wd"] and c["fee"] is not None]
+    return min(ok) if ok else None
+
+
+def fmt(p):
+    return f"{p:.6g}"
+
+
+def send(text):
+    r = requests.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        json={"chat_id": CHAT_ID, "text": text},
+        timeout=15,
+    )
+    r.raise_for_status()
 
 
 def main():
-    xt = safe(price_xt)
-    lb = safe(price_lbank)
+    xt = books_xt()
+    lb = books_lbank()
+    common = sorted(set(xt) & set(lb))
 
-    if xt is None and lb is None:
-        print("هیچ‌کدوم از صرافی‌ها جواب ندادن", file=sys.stderr)
-        sys.exit(1)
+    gaps = []
+    for sym in common:
+        xbid, xbq, xask, xaq = xt[sym]
+        lbid, lbq, lask, laq = lb[sym]
+        for buy, sell, ask, aq, bid, bq in (
+            ("XT", "LBank", xask, xaq, lbid, lbq),
+            ("LBank", "XT", lask, laq, xbid, xbq),
+        ):
+            gross = (bid - ask) / ask * 100
+            depth = min(aq * ask, bq * bid)
+            if gross > 0:
+                gaps.append(
+                    dict(sym=sym, buy=buy, sell=sell, ask=ask, bid=bid,
+                         gross=gross, depth=depth)
+                )
+    gaps.sort(key=lambda g: g["gross"], reverse=True)
+    cands = [
+        g for g in gaps
+        if g["gross"] >= MIN_GROSS_PCT and g["depth"] >= MIN_DEPTH_USDT
+    ][:MAX_CANDIDATES]
 
-    lines = ["💰 قیمت بیت‌کوین (BTC/USDT)", ""]
-    lines.append(f"XT: {xt:,.2f} $" if xt else "XT: خطا در دریافت قیمت")
-    lines.append(f"LBank: {lb:,.2f} $" if lb else "LBank: خطا در دریافت قیمت")
+    try:
+        xt_chains = chains_xt()
+    except Exception as e:
+        print("خطا در دریافت اطلاعات کوین‌های XT:", e, file=sys.stderr)
+        xt_chains = {}
 
-    if xt and lb:
-        diff = xt - lb
-        pct = diff / lb * 100
-        lines += ["", f"اختلاف: {diff:+,.2f} $ ({pct:+.3f}%)"]
+    results = []
+    for g in cands:
+        coin = g["sym"][:-5]
+        try:
+            src = xt_chains.get(coin, []) if g["buy"] == "XT" else chains_lbank(coin)
+        except Exception as e:
+            print(f"خطا برای {coin}:", e, file=sys.stderr)
+            continue
+        wfee = cheapest_withdraw(src)
+        if wfee is None:
+            continue  # برداشت بسته یا نامشخص
 
-    r = requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        json={"chat_id": CHAT_ID, "text": "\n".join(lines)},
-        timeout=10,
-    )
-    r.raise_for_status()
+        warn = []
+        if g["sell"] == "XT":
+            dst = xt_chains.get(coin, [])
+            if dst and not any(c["dep"] for c in dst):
+                continue  # واریز در XT بسته است
+        else:
+            warn.append("باز بودن واریز در LBank رو دستی چک کن")
+        if g["gross"] >= SUSPECT_GROSS_PCT:
+            warn.append("اختلاف خیلی زیاده؛ احتمالاً توکن متفاوت با اسم مشابه")
+
+        usable = min(TRADE_USDT, g["depth"])
+        fee_buy = FEE_XT if g["buy"] == "XT" else FEE_LBANK
+        fee_sell = FEE_LBANK if g["buy"] == "XT" else FEE_XT
+        qty = usable / g["ask"] * (1 - fee_buy) - wfee
+        if qty <= 0:
+            continue
+        net = qty * g["bid"] * (1 - fee_sell) - usable
+        net_pct = net / usable * 100
+        if net >= MIN_NET_USDT and net_pct >= MIN_NET_PCT:
+            results.append({**g, "wfee_usd": wfee * g["ask"], "usable": usable,
+                            "net": net, "net_pct": net_pct, "warn": warn})
+    results.sort(key=lambda r: r["net"], reverse=True)
+
+    lines = []
+    if results:
+        lines.append(f"🔔 فرصت آربیتراژ XT ↔ LBank (معامله فرضی {TRADE_USDT:,} $)")
+        lines.append("")
+        for r in results[:TOP_N]:
+            coin = r["sym"][:-5].upper()
+            lines.append(
+                f"{coin}: بخر از {r['buy']} ({fmt(r['ask'])}) ← "
+                f"بفروش در {r['sell']} ({fmt(r['bid'])})"
+            )
+            lines.append(
+                f"اختلاف ناخالص: {r['gross']:.2f}% | "
+                f"کارمزد برداشت: {r['wfee_usd']:.2f}$"
+            )
+            lines.append(
+                f"سود خالص برای {r['usable']:,.0f}$: "
+                f"{r['net']:.2f}$ ({r['net_pct']:.2f}%)"
+            )
+            for w in r["warn"]:
+                lines.append(f"⚠️ {w}")
+            lines.append("")
+    elif MANUAL_RUN:
+        lines.append("✅ اجرای تستی موفق بود")
+        lines.append(f"تعداد کوین‌های مشترک (جفت USDT): {len(common)}")
+        lines.append("بعد از کارمزدها فرصت سودآوری پیدا نشد.")
+        if gaps:
+            lines.append("")
+            lines.append("بیشترین اختلاف‌ها (قبل از کارمزد):")
+            for g in gaps[:TOP_N]:
+                lines.append(
+                    f"{g['sym'][:-5].upper()}: {g['gross']:.2f}% "
+                    f"(بخر {g['buy']} ← بفروش {g['sell']}، حجم {g['depth']:,.0f}$)"
+                )
+    else:
+        print("فرصتی پیدا نشد")
+        return
+
+    send("\n".join(lines))
 
 
 if __name__ == "__main__":
