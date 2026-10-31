@@ -24,7 +24,7 @@ TOP_N = 5
 # در اجرای دستی (Run workflow) آستانه‌ها شل می‌شن تا محاسبه‌ها تست بشن.
 # اجرای زمان‌بندی‌شده همیشه با مقدارهای بالا کار می‌کنه.
 if MANUAL_RUN:
-    MIN_GROSS_PCT = 0.1
+    MIN_GROSS_PCT = -100
     MIN_NET_USDT = -1000
     MIN_NET_PCT = -100
     MIN_DEPTH_USDT = 50
@@ -179,7 +179,7 @@ def main():
         ):
             gross = (bid - ask) / ask * 100
             depth = min(aq * ask, bq * bid)
-            if gross > 0:
+            if gross > 0 or MANUAL_RUN:
                 gaps.append(
                     dict(sym=sym, buy=buy, sell=sell, ask=ask, bid=bid,
                          gross=gross, depth=depth)
@@ -235,7 +235,7 @@ def main():
     if results:
         title = "🔔 فرصت آربیتراژ XT ↔ LBank"
         if MANUAL_RUN:
-            title = "🧪 حالت تست (آستانه‌ها شل شده)\n" + title
+            title = "🧪 حالت تست (آستانه‌ها شل شده، سود منفی عادیه)\n" + title
         lines.append(f"{title} (معامله فرضی {TRADE_USDT:,} $)")
         lines.append(f"کوین‌های مشترک: {len(common)} | بررسی دقیق: {len(lb)}")
         lines.append("")
@@ -260,16 +260,7 @@ def main():
         lines.append("✅ اجرای تستی موفق بود")
         lines.append(f"تعداد کوین‌های مشترک (جفت USDT): {len(common)}")
         lines.append(f"بررسی دقیق شده: {len(lb)} کوین")
-        lines.append("هیچ کوینی از فیلترها رد نشد.")
-        real = [g for g in gaps if g["depth"] >= MIN_DEPTH_USDT]
-        if real:
-            lines.append("")
-            lines.append(f"بیشترین اختلاف‌ها با حجم حداقل {MIN_DEPTH_USDT}$ (قبل از کارمزد):")
-            for g in real[:TOP_N]:
-                lines.append(
-                    f"{g['sym'][:-5].upper()}: {g['gross']:.2f}% "
-                    f"(بخر {g['buy']} ← بفروش {g['sell']}، حجم {g['depth']:,.0f}$)"
-                )
+        lines.append("هیچ کوینی از فیلترها عبور نکرد.")
     else:
         print("فرصتی پیدا نشد")
         return
