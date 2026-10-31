@@ -1,3 +1,4 @@
+import html
 import os
 import sys
 import requests
@@ -20,6 +21,7 @@ MIN_DEPTH_USDT = 300     # حداقل حجم موجود در بالای دفتر
 SUSPECT_GROSS_PCT = 15   # اختلاف بالاتر از این مشکوکه
 MAX_CANDIDATES = 15
 TOP_N = 5
+SEP = "━━━━━━━━━━━━━━"
 
 # در اجرای دستی (Run workflow) آستانه‌ها شل می‌شن تا محاسبه‌ها تست بشن.
 # اجرای زمان‌بندی‌شده همیشه با مقدارهای بالا کار می‌کنه.
@@ -137,10 +139,33 @@ def fmt(p):
 def send(text):
     r = requests.post(
         f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        json={"chat_id": CHAT_ID, "text": text},
+        json={
+            "chat_id": CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
         timeout=15,
     )
     r.raise_for_status()
+
+
+def format_result(r):
+    coin = html.escape(r["sym"][:-5].upper())
+    icon = "✅" if r["net"] >= 0 else "❌"
+    sign = "+" if r["net"] >= 0 else ""
+    parts = [
+        f"🪙 <b>{coin}</b>",
+        f"🟢 خرید از <b>{r['buy']}</b>: <code>{fmt(r['ask'])}</code>",
+        f"🔴 فروش در <b>{r['sell']}</b>: <code>{fmt(r['bid'])}</code>",
+        f"📊 اختلاف ناخالص: <code>{r['gross']:.2f}%</code>",
+        f"💸 کارمزد برداشت: <code>{r['wfee_usd']:.2f}$</code>",
+        f"{icon} سود خالص ({r['usable']:,.0f}$): "
+        f"<b>{sign}{r['net']:.2f}$ ({sign}{r['net_pct']:.2f}%)</b>",
+    ]
+    for w in r["warn"]:
+        parts.append(f"⚠️ {html.escape(w)}")
+    return "\n".join(parts)
 
 
 def main():
@@ -231,41 +256,28 @@ def main():
                             "net": net, "net_pct": net_pct, "warn": warn})
     results.sort(key=lambda r: r["net"], reverse=True)
 
-    lines = []
     if results:
-        title = "🔔 فرصت آربیتراژ XT ↔ LBank"
+        header = "🔔 <b>فرصت آربیتراژ XT ⇄ LBank</b>"
         if MANUAL_RUN:
-            title = "🧪 حالت تست (آستانه‌ها شل شده، سود منفی عادیه)\n" + title
-        lines.append(f"{title} (معامله فرضی {TRADE_USDT:,} $)")
-        lines.append(f"کوین‌های مشترک: {len(common)} | بررسی دقیق: {len(lb)}")
-        lines.append("")
-        for r in results[:TOP_N]:
-            coin = r["sym"][:-5].upper()
-            lines.append(
-                f"{coin}: بخر از {r['buy']} ({fmt(r['ask'])}) ← "
-                f"بفروش در {r['sell']} ({fmt(r['bid'])})"
-            )
-            lines.append(
-                f"اختلاف ناخالص: {r['gross']:.2f}% | "
-                f"کارمزد برداشت: {r['wfee_usd']:.2f}$"
-            )
-            lines.append(
-                f"سود خالص برای {r['usable']:,.0f}$: "
-                f"{r['net']:.2f}$ ({r['net_pct']:.2f}%)"
-            )
-            for w in r["warn"]:
-                lines.append(f"⚠️ {w}")
-            lines.append("")
+            header = "🧪 <b>حالت تست</b> (سود منفی عادیه)\n" + header
+        info = (
+            f"معامله فرضی: {TRADE_USDT:,}$ | "
+            f"بررسی‌شده: {len(lb)} از {len(common)} کوین"
+        )
+        body = ("\n" + SEP + "\n").join(format_result(r) for r in results[:TOP_N])
+        text = f"{header}\n{info}\n{SEP}\n{body}\n{SEP}"
     elif MANUAL_RUN:
-        lines.append("✅ اجرای تستی موفق بود")
-        lines.append(f"تعداد کوین‌های مشترک (جفت USDT): {len(common)}")
-        lines.append(f"بررسی دقیق شده: {len(lb)} کوین")
-        lines.append("هیچ کوینی از فیلترها عبور نکرد.")
+        text = (
+            "✅ <b>اجرای تستی موفق بود</b>\n"
+            f"کوین‌های مشترک (جفت USDT): {len(common)}\n"
+            f"بررسی دقیق شده: {len(lb)} کوین\n"
+            "هیچ کوینی از فیلترها عبور نکرد."
+        )
     else:
         print("فرصتی پیدا نشد")
         return
 
-    send("\n".join(lines))
+    send(text)
 
 
 if __name__ == "__main__":
