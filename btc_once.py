@@ -10,6 +10,8 @@ MANUAL_RUN = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
 TRADE_USDT = 1000        # حجم معامله فرضی
 FEE_XT = 0.002           # کارمزد معامله XT (حدس: ۰.۲٪)
 FEE_LBANK = 0.001        # کارمزد معامله LBank (حدس: ۰.۱٪)
+PREFILTER_PCT = 0.5      # پیش‌فیلتر با آخرین قیمت معامله
+MAX_LBANK_BOOKS = 40     # حداکثر تعداد کوین برای بررسی دقیق در LBank
 MIN_GROSS_PCT = 1.0      # حداقل اختلاف ناخالص برای بررسی بیشتر
 MIN_NET_USDT = 5         # حداقل سود خالص (دلار) برای ارسال پیام
 MIN_NET_PCT = 0.5        # حداقل سود خالص (درصد)
@@ -49,21 +51,36 @@ def books_xt():
     return out
 
 
-def books_lbank():
-    data = get(
-        "https://api.lbkex.com/v2/supplement/ticker/bookTicker.do",
-        symbol="all",
-    )["data"]
+def lbank_last_prices():
+    j = get("https://api.lbkex.com/v2/ticker/24hr.do", symbol="all")
+    data = j.get("data") if isinstance(j, dict) else None
+    if not isinstance(data, list):
+        raise RuntimeError("LBank ticker/24hr جواب غیرمنتظره داد: " + str(j)[:400])
     out = {}
     for it in data:
         sym = str(it.get("symbol", "")).lower()
         if not sym.endswith("_usdt"):
             continue
-        bid, bq = num(it.get("bidPrice")), num(it.get("bidQty"))
-        ask, aq = num(it.get("askPrice")), num(it.get("askQty"))
-        if bid and bq and ask and aq:
-            out[sym] = (bid, bq, ask, aq)
+        p = num((it.get("ticker") or {}).get("latest"))
+        if p:
+            out[sym] = p
     return out
+
+
+def lbank_book(sym):
+    j = get(
+        "https://api.lbkex.com/v2/supplement/ticker/bookTicker.do", symbol=sym
+    )
+    data = j.get("data") if isinstance(j, dict) else None
+    if isinstance(data, list):
+        data = data[0] if data else None
+    if not isinstance(data, dict):
+        raise RuntimeError(f"LBank bookTicker {sym} جواب غیرمنتظره داد: " + str(j)[:400])
+    bid, bq = num(data.get("bidPrice")), num(data.get("bidQty"))
+    ask, aq = num(data.get("askPrice")), num(data.get("askQty"))
+    if bid and bq and ask and aq:
+        return (bid, bq, ask, aq)
+    return None
 
 
 def chains_xt():
@@ -85,9 +102,10 @@ def chains_xt():
 
 
 def chains_lbank(coin):
-    data = get(
-        "https://api.lbkex.com/v2/withdrawConfigs.do", assetCode=coin
-    )["data"]
+    j = get("https://api.lbkex.com/v2/withdrawConfigs.do", assetCode=coin)
+    data = j.get("data") if isinstance(j, dict) else None
+    if not isinstance(data, list):
+        raise RuntimeError(f"LBank withdrawConfigs {coin}: " + str(j)[:300])
     return [
         {
             "wd": str(d.get("canWithDraw")).lower() == "true",
@@ -118,11 +136,32 @@ def send(text):
 
 def main():
     xt = books_xt()
-    lb = books_lbank()
-    common = sorted(set(xt) & set(lb))
+    lb_last = lbank_last_prices()
+    common = sorted(set(xt) & set(lb_last))
+
+    # مرحله ۱: پیش‌فیلتر با آخرین قیمت معامله
+    pre = []
+    for sym in common:
+        xbid, xbq, xask, xaq = xt[sym]
+        mid = (xbid + xask) / 2
+        gap = abs(lb_last[sym] - mid) / mid * 100
+        if gap >= PREFILTER_PCT:
+            pre.append((gap, sym))
+    pre.sort(reverse=True)
+
+    # مرحله ۲: قیمت دقیق خرید/فروش LBank فقط برای کوین‌های پیش‌فیلتر شده
+    lb = {}
+    for gap, sym in pre[:MAX_LBANK_BOOKS]:
+        try:
+            b = lbank_book(sym)
+        except Exception as e:
+            print(e, file=sys.stderr)
+            continue
+        if b:
+            lb[sym] = b
 
     gaps = []
-    for sym in common:
+    for sym in sorted(lb):
         xbid, xbq, xask, xaq = xt[sym]
         lbid, lbq, lask, laq = lb[sym]
         for buy, sell, ask, aq, bid, bq in (
@@ -207,6 +246,7 @@ def main():
     elif MANUAL_RUN:
         lines.append("✅ اجرای تستی موفق بود")
         lines.append(f"تعداد کوین‌های مشترک (جفت USDT): {len(common)}")
+        lines.append(f"بررسی دقیق شده: {len(lb)} کوین")
         lines.append("بعد از کارمزدها فرصت سودآوری پیدا نشد.")
         if gaps:
             lines.append("")
